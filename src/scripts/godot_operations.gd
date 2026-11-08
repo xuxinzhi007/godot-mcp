@@ -17,8 +17,18 @@ const PROTOCOL_VERSION := 2
 const RESULTS_PREFIX := "[RESULT]"
 
 var debug_mode := false
+var _last_guard_error := ""
 
 
+var _operation := ""
+var _params: Dictionary = {}
+var _parsed := false
+
+
+## Argument parsing only. The actual work happens in _initialize(), because in
+## `--script` mode the project autoloads are not registered yet while _init()
+## runs — a scene script referencing a singleton would fail to compile there and
+## re-packing it would write `script = null`.
 func _init() -> void:
 	var argv := OS.get_cmdline_args()
 	debug_mode = "--debug-godot" in argv
@@ -34,7 +44,7 @@ func _init() -> void:
 		_fatal("Usage: godot --headless --path <project> --script godot_operations.gd <operation> <json_params>")
 		return
 
-	var operation: String = argv[operation_index]
+	_operation = argv[operation_index]
 	var params_json: String = argv[params_index]
 
 	var json := JSON.new()
@@ -43,13 +53,20 @@ func _init() -> void:
 			params_json, json.get_error_line(), json.get_error_message()])
 		return
 
-	var params = json.get_data()
-	if typeof(params) != TYPE_DICTIONARY:
+	var parsed = json.get_data()
+	if typeof(parsed) != TYPE_DICTIONARY:
 		_fatal("params must be a JSON object")
 		return
 
-	_log("protocol=%d op=%s params=%s" % [PROTOCOL_VERSION, operation, params_json])
-	quit(_dispatch(operation, params))
+	_params = parsed
+	_parsed = true
+
+
+func _initialize() -> void:
+	if not _parsed:
+		return
+	_log("protocol=%d op=%s" % [PROTOCOL_VERSION, _operation])
+	quit(_dispatch(_operation, _params))
 
 
 func _fatal(message: String) -> void:
@@ -321,11 +338,82 @@ func _guard_scene_write(res_path: String, params: Dictionary) -> String:
 
 
 ## Instantiate a scene for editing (edit-state instance keeps editor metadata).
+## Instantiate a scene for editing. Returns null (and sets _last_guard_error)
+## when re-packing would damage the file — see _guard_scene_scripts.
 func _instantiate_for_edit(res_path: String):
+	_last_guard_error = ""
 	var packed = _load_scene(res_path)
 	if packed == null:
 		return null
-	return packed.instantiate(PackedScene.GEN_EDIT_STATE_INSTANCE)
+	var root = packed.instantiate(PackedScene.GEN_EDIT_STATE_INSTANCE)
+	var guard := _guard_scene_scripts(res_path, root)
+	if not guard.is_empty():
+		_last_guard_error = guard
+		root.free()
+		return null
+	return root
+
+
+func _instantiate_error(scene_path: String) -> String:
+	if not _last_guard_error.is_empty():
+		return _last_guard_error
+	return "Failed to instantiate scene: " + scene_path
+
+
+## Re-packing is only ever safe when every script in the scene compiles in this
+## process. In `--headless --script` mode the project autoloads are not
+## registered, so a script that references a singleton fails to compile, load()
+## returns null, the instantiated node has no script, and pack() writes
+## `script = null` — silently stripping the logic from the scene. Refuse instead.
+func _guard_scene_scripts(res_path: String, root: Node) -> String:
+	var handle := FileAccess.open(_abs_path(res_path), FileAccess.READ)
+	if handle == null:
+		return ""
+	var text := handle.get_as_text()
+	handle.close()
+	var lines := text.split("\n")
+
+	var broken := []
+	for line in lines:
+		if not line.begins_with("[ext_resource"):
+			continue
+		if not line.contains('type="Script"'):
+			continue
+		var script_path := _extract_attr(line, "path")
+		if script_path.is_empty():
+			continue
+		if load(script_path) == null:
+			broken.append(script_path)
+
+	if broken.size() > 0:
+		return ("Refusing to rewrite '%s': these scripts do not compile in a headless "
+			% res_path) + \
+			"process (they most likely reference autoload singletons): %s.\n" % str(broken) + \
+			"Re-packing would save them as \"script = null\" and silently remove the scene logic. " + \
+			"Edit the scene as text with read_file/write_file instead."
+
+	# The root node must keep whatever script the file declares for it.
+	var root_has_script := false
+	var index := 0
+	while index < lines.size() and not lines[index].begins_with("[node "):
+		index += 1
+	if index < lines.size():
+		index += 1
+		while index < lines.size():
+			var stripped := lines[index].strip_edges()
+			if stripped.begins_with("[") or stripped.is_empty():
+				break
+			if stripped.begins_with("script = "):
+				root_has_script = true
+			index += 1
+
+	if root_has_script and root.get_script() == null:
+		return ("Refusing to rewrite '%s': the root node's script did not survive "
+			% res_path) + \
+			"instantiation (headless compile failure), so saving would write \"script = null\". " + \
+			"Edit the scene as text with read_file/write_file instead."
+
+	return ""
 
 
 func _save_packed(root: Node, res_path: String) -> int:
@@ -653,7 +741,7 @@ func add_node(params: Dictionary) -> int:
 
 	var scene_root = _instantiate_for_edit(scene_path)
 	if scene_root == null:
-		return _err("Failed to instantiate scene: " + scene_path)
+		return _err(_instantiate_error(scene_path))
 
 	var parent_path := _node_path(params.get("parent_node_path", "root"))
 	var parent: Node = scene_root if parent_path == NodePath(".") else scene_root.get_node_or_null(parent_path)
@@ -726,7 +814,7 @@ func modify_node(params: Dictionary) -> int:
 
 	var scene_root = _instantiate_for_edit(scene_path)
 	if scene_root == null:
-		return _err("Failed to instantiate scene: " + scene_path)
+		return _err(_instantiate_error(scene_path))
 
 	var target_path := _node_path(params.get("node_path", "root"))
 	var node: Node = scene_root if target_path == NodePath(".") else scene_root.get_node_or_null(target_path)
@@ -785,7 +873,7 @@ func remove_node(params: Dictionary) -> int:
 
 	var scene_root = _instantiate_for_edit(scene_path)
 	if scene_root == null:
-		return _err("Failed to instantiate scene: " + scene_path)
+		return _err(_instantiate_error(scene_path))
 
 	var target_path := _node_path(params.get("node_path", ""))
 	if target_path == NodePath("."):
@@ -849,7 +937,7 @@ func attach_script(params: Dictionary) -> int:
 
 	var scene_root = _instantiate_for_edit(scene_path)
 	if scene_root == null:
-		return _err("Failed to instantiate scene: " + scene_path)
+		return _err(_instantiate_error(scene_path))
 
 	var target_path := _node_path(node_path_raw)
 	var node: Node = scene_root if target_path == NodePath(".") else scene_root.get_node_or_null(target_path)
@@ -902,7 +990,7 @@ func load_sprite(params: Dictionary) -> int:
 
 	var scene_root = _instantiate_for_edit(scene_path)
 	if scene_root == null:
-		return _err("Failed to instantiate scene: " + scene_path)
+		return _err(_instantiate_error(scene_path))
 
 	var target_path := _node_path(params.get("node_path", "root"))
 	var node: Node = scene_root if target_path == NodePath(".") else scene_root.get_node_or_null(target_path)
@@ -955,7 +1043,7 @@ func save_scene(params: Dictionary) -> int:
 
 	var scene_root = _instantiate_for_edit(scene_path)
 	if scene_root == null:
-		return _err("Failed to instantiate scene: " + scene_path)
+		return _err(_instantiate_error(scene_path))
 
 	var save_error := _save_packed(scene_root, target_path)
 	scene_root.free()
@@ -985,7 +1073,7 @@ func export_mesh_library(params: Dictionary) -> int:
 
 	var scene_root = _instantiate_for_edit(scene_path)
 	if scene_root == null:
-		return _err("Failed to instantiate scene: " + scene_path)
+		return _err(_instantiate_error(scene_path))
 
 	var mesh_item_names = params.get("mesh_item_names", [])
 	var use_specific: bool = typeof(mesh_item_names) == TYPE_ARRAY and mesh_item_names.size() > 0
