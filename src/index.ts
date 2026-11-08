@@ -401,6 +401,21 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: 'rewrite_references',
+    description:
+      'Rewrite res:// references from one project path to another without touching files. Use after converting an asset (e.g. .png -> .webp) or to repair references.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectPath: PROJECT_PATH,
+        fromPath: { type: 'string', description: 'Old project-relative path' },
+        toPath: { type: 'string', description: 'New project-relative path' },
+        dryRun: { type: 'boolean', description: 'Only report what would change (default false)' },
+      },
+      required: ['projectPath', 'fromPath', 'toPath'],
+    },
+  },
+  {
     name: 'find_references',
     description: 'Find every scene/resource/script that references a file (by res:// path, bare path or UID). Run this before moving or deleting anything.',
     inputSchema: {
@@ -955,6 +970,7 @@ class GodotServer {
       write_file: (a) => this.handleWriteFile(a),
       delete_file: (a) => this.handleDeleteFile(a),
       move_file: (a) => this.handleMoveFile(a),
+      rewrite_references: (a) => this.handleRewriteReferences(a),
       find_references: (a) => this.handleFindReferences(a),
       read_scene: (a) => this.handleReadScene(a),
       scene_structure: (a) => this.handleSceneStructure(a),
@@ -1250,6 +1266,41 @@ class GodotServer {
       if (/^uid:\/\/\w+$/.test(sidecar)) return sidecar;
     }
     return null;
+  }
+
+  private async handleRewriteReferences(args: Record<string, unknown>): Promise<ToolResult> {
+    const projectPath = this.resolveProject(String(args.projectPath ?? ''));
+    const normalise = (value: string): string => value.trim().replace(/^res:\/\//, '').replace(/\\/g, '/');
+    const fromRel = normalise(String(args.fromPath ?? ''));
+    const toRel = normalise(String(args.toPath ?? ''));
+    if (!fromRel || !toRel) throw new ToolError('fromPath and toPath are required');
+    if (fromRel === toRel) throw new ToolError('fromPath and toPath are the same');
+    const dryRun = args.dryRun === true;
+
+    const changed: Array<{ file: string; replacements: number }> = [];
+    for (const file of this.referenceFiles(projectPath)) {
+      const text = readTextFile(file);
+      if (!text) continue;
+      const count = text.split(`res://${fromRel}`).length - 1
+        + text.split(`"${fromRel}"`).length - 1
+        + text.split(`'${fromRel}'`).length - 1;
+      if (count === 0) continue;
+      const next = text
+        .replaceAll(`res://${fromRel}`, `res://${toRel}`)
+        .replaceAll(`"${fromRel}"`, `"${toRel}"`)
+        .replaceAll(`'${fromRel}'`, `'${toRel}'`);
+      if (!dryRun) writeFileSync(file, next, 'utf8');
+      changed.push({ file: relative(projectPath, file).split(sep).join('/'), replacements: count });
+    }
+
+    return ok({
+      from: fromRel,
+      to: toRel,
+      dryRun,
+      files_changed: changed.length,
+      total_replacements: changed.reduce((sum, entry) => sum + entry.replacements, 0),
+      changes: changed.slice(0, 100),
+    });
   }
 
   private async handleFindReferences(args: Record<string, unknown>): Promise<ToolResult> {

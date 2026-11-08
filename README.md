@@ -72,11 +72,34 @@ A complete agent loop: **see → edit → verify → run → observe**.
 | Area | Tools |
 |---|---|
 | Project | `get_godot_version`, `list_projects`, `get_project_info`, `read_project_settings`, `list_files`, `read_file`, `write_file`, `delete_file` |
+| Refactor assets | `find_references`, `move_file` (reference-aware rename), `rewrite_references` |
 | Scenes (read) | `read_scene`, `scene_structure` |
 | Scenes (write) | `create_scene`, `add_node`, `modify_node`, `remove_node`, `attach_script`, `load_sprite`, `save_scene`, `export_mesh_library` |
 | Resources / UID | `get_uid`, `update_project_uids` |
 | Scripts | `validate_script`, `run_script` |
 | Run / debug | `launch_editor`, `run_project`, `get_debug_output`, `stop_project` |
+
+### Asset refactoring workflow
+
+Reorganising a project touches three things at once: the file, its /
+sidecars, and every  reference. Use these tools in this order:
+
+1.  - see what references the file before touching it.
+   It skips the file's own , which would otherwise always match.
+2.  - move/rename it. The tool carries the  and 
+   sidecars, rewrites , and rewrites every  reference.
+3.  - when the file is replaced rather than moved
+   (e.g. a  re-encoded to ), repoint references without moving anything.
+
+> **Clear  after replacing assets.** Godot resolves a scene's
+>  through that cache first; a stale entry makes it look for the
+> deleted path and fail with ,
+> even though the scene text is already correct. Deleting the cache is safe -
+> it is rebuilt on next editor start.
+
+Helper scripts (read-only, run with plain node):
+
+
 
 ### Safety model
 
