@@ -81,24 +81,35 @@ A complete agent loop: **see → edit → verify → run → observe**.
 
 ### Asset refactoring workflow
 
-Reorganising a project touches three things at once: the file, its /
-sidecars, and every  reference. Use these tools in this order:
+Reorganising a project touches three things at once: the file, its `.import`/`.uid`
+sidecars, and every `res://` reference. Use these tools in this order:
 
-1.  - see what references the file before touching it.
-   It skips the file's own , which would otherwise always match.
-2.  - move/rename it. The tool carries the  and 
-   sidecars, rewrites , and rewrites every  reference.
-3.  - when the file is replaced rather than moved
-   (e.g. a  re-encoded to ), repoint references without moving anything.
+1. `find_references` — see what references the file before touching it. It skips
+   the file's own `.import`, which would otherwise always match.
+2. `move_file` — move/rename it. The tool carries the `.import` and `.uid`
+   sidecars, rewrites `source_file`, and rewrites every `res://` reference.
+3. `rewrite_references` — when the file is replaced rather than moved (e.g. a
+   `.png` re-encoded to `.webp`), repoint references without moving anything.
 
-> **Clear  after replacing assets.** Godot resolves a scene's
->  through that cache first; a stale entry makes it look for the
-> deleted path and fail with ,
-> even though the scene text is already correct. Deleting the cache is safe -
-> it is rebuilt on next editor start.
+> **Clear `.godot/uid_cache.bin` after replacing assets.** Godot resolves a
+> scene's `uid="uid://..."` through that cache first, so a stale entry makes it
+> look for the deleted path and fail with `[ext_resource] referenced
+> non-existent resource` even though the scene text is already correct. Deleting
+> the cache is safe — it is rebuilt on the next editor start.
 
-Helper scripts (read-only, run with plain node):
+Helper scripts (read-only unless noted):
 
+```bash
+node scripts/audit-assets.mjs <project>       # unused assets, junk, duplicates, size per dir
+node scripts/check-refs.mjs <project>         # every res:// reference resolves (exit 1 if not)
+node scripts/check-stale-refs.mjs <project>   # leftover old paths after a rename pass
+node scripts/find-decor-scales.mjs <project>  # instanced scenes and their scale overrides
+```
+
+`scripts/optimize_textures.gd` is a one-off texture optimiser: run it through the
+`run_script` tool, not with node. It crops animation frames to their used rect,
+downscales them, and re-encodes the remaining bitmaps to WebP — reporting the
+size delta and the scale factor the scene must compensate with.
 
 
 ### Safety model
