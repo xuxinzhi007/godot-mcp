@@ -446,6 +446,16 @@ func _apply_property(node: Object, property: String, raw_value) -> Dictionary:
 		target_type = typeof(node.get(property))
 
 	var expected = _coerce_value(raw_value, target_type)
+	# A non-null request that coerced to null means the conversion failed (most
+	# often a res:// path that does not exist or is not imported yet). Report it
+	# instead of silently writing null.
+	if expected == null and raw_value != null:
+		return {
+			"property": property,
+			"ok": false,
+			"reason": "value could not be converted; for res:// paths the file must exist and be imported",
+			"requested": _jsonable(raw_value),
+		}
 	node.set(property, expected)
 	var actual = node.get(property)
 

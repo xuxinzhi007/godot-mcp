@@ -17,9 +17,15 @@
  *     ]
  *   }
  *
+ * By default it drives the `godot` server from build/index.js. Set
+ * PROBE_MCP=<name> to drive any stdio server configured in ~/.pi/agent/mcp.json
+ * (for example PROBE_MCP=comfyui).
+ *
  * Exit code is 1 when any step does not match its expectation.
  */
 import { readFileSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
@@ -31,10 +37,25 @@ if (!planPath) {
 const plan = JSON.parse(readFileSync(planPath, 'utf8'));
 const showDebug = process.env.SHOW_DEBUG === 'true';
 
+function resolveServer() {
+  const name = process.env.PROBE_MCP;
+  if (!name || name === 'godot') {
+    return { command: process.execPath, args: ['build/index.js'], env: {} };
+  }
+  const configPath = join(homedir(), '.pi', 'agent', 'mcp.json');
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  const entry = config.mcpServers?.[name];
+  if (!entry?.command) {
+    throw new Error(`MCP server "${name}" not found in ${configPath}`);
+  }
+  return { command: entry.command, args: entry.args ?? [], env: entry.env ?? {} };
+}
+
+const target = resolveServer();
 const transport = new StdioClientTransport({
-  command: process.execPath,
-  args: ['build/index.js'],
-  env: { ...process.env, DEBUG: showDebug ? 'true' : 'false' },
+  command: target.command,
+  args: target.args,
+  env: { ...process.env, ...target.env, DEBUG: showDebug ? 'true' : 'false' },
   stderr: 'pipe',
 });
 
