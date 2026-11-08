@@ -25,6 +25,7 @@ import {
   statSync,
 } from 'fs';
 import { spawn, execFile, type ChildProcess } from 'child_process';
+import { homedir } from 'os';
 import { promisify } from 'util';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -156,6 +157,40 @@ function extractOperationErrors(stderr: string): string[] {
     }
   }
   return errors;
+}
+
+/** Splits Godot's stderr into error blocks, warning blocks and everything else.
+ *  Continuation lines (indented `at:`, `GDScript backtrace`, frame lines) are
+ *  kept attached to the entry they belong to, so a block reads as a unit. */
+function classifyStderr(lines: string[]): { errors: string[]; warnings: string[]; other: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const other: string[] = [];
+  let current: 'error' | 'warning' | null = null;
+
+  for (const line of lines) {
+    const trimmed = line.trimEnd();
+    if (!trimmed.trim()) continue;
+    const isContinuation = /^\s+/.test(trimmed) || /^\s*\[\d+\]\s/.test(trimmed) || trimmed.startsWith('GDScript backtrace');
+
+    if (!isContinuation && /^(ERROR|SCRIPT ERROR):/.test(trimmed)) {
+      errors.push(trimmed);
+      current = 'error';
+      continue;
+    }
+    if (!isContinuation && trimmed.startsWith('WARNING:')) {
+      warnings.push(trimmed);
+      current = 'warning';
+      continue;
+    }
+    if (isContinuation && current !== null) {
+      (current === 'error' ? errors : warnings).push(trimmed);
+      continue;
+    }
+    other.push(trimmed);
+    current = null;
+  }
+  return { errors, warnings, other };
 }
 
 /** Godot's own runtime complaints, useful when the operation script itself blew up. */
@@ -673,7 +708,7 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'get_debug_output',
     description:
-      'Read captured stdout/stderr of the last run. Output is kept after the process exits, so finished runs stay inspectable. Use since/clear to page through it.',
+      'Read captured stdout/stderr of the last run. Output is kept after the process exits. Godot writes warnings to stderr too, so pass severity to separate real errors from warning noise. Use since/clear to page through it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -681,8 +716,34 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         tail: { type: 'number', description: 'Return only the last N lines (default 200)' },
         clear: { type: 'boolean', description: 'Clear the buffer after reading (default false)' },
         includeErrors: { type: 'boolean', description: 'Include the stderr stream (default true)' },
+        severity: {
+          type: 'string',
+          enum: ['all', 'errors', 'warnings'],
+          description:
+            'all (default) returns every stderr line as before; errors returns only ERROR:/SCRIPT ERROR: blocks with their backtraces; warnings returns only WARNING: blocks',
+        },
       },
       required: [],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'read_editor_log',
+    description:
+      "Read the Godot editor's own log (user://logs/godot.log). This is the only way to see errors from a run you started inside the editor with F5, because that process writes to the editor's output panel instead of to this server.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        projectPath: PROJECT_PATH,
+        logPath: { type: 'string', description: 'Explicit log file path (overrides the automatic lookup)' },
+        tail: { type: 'number', description: 'Return only the last N lines of each section (default 200)' },
+        severity: {
+          type: 'string',
+          enum: ['all', 'errors', 'warnings'],
+          description: 'all (default) returns errors, warnings and plain prints; errors/warnings filters',
+        },
+      },
+      required: ['projectPath'],
     },
     annotations: { readOnlyHint: true },
   },
@@ -989,6 +1050,7 @@ class GodotServer {
       launch_editor: (a) => this.handleLaunchEditor(a),
       run_project: (a) => this.handleRunProject(a),
       get_debug_output: (a) => this.handleGetDebugOutput(a),
+      read_editor_log: (a) => this.handleReadEditorLog(a),
       stop_project: () => this.handleStopProject(),
     };
   }
@@ -1795,10 +1857,22 @@ class GodotServer {
     const since = typeof args.since === 'number' ? Math.max(0, Math.trunc(args.since)) : 0;
     const tail = typeof args.tail === 'number' ? Math.max(1, Math.trunc(args.tail)) : 200;
     const includeErrors = args.includeErrors !== false;
+    const severity = typeof args.severity === 'string' ? args.severity : 'all';
 
     const outputFromSince = state.output.slice(since);
     const outputTruncatedToTail = outputFromSince.slice(-tail);
-    const errorsTail = state.errors.slice(-tail);
+    const split = classifyStderr(state.errors);
+
+    const errors = split.errors.slice(-tail);
+    const warnings = split.warnings.slice(-tail);
+    const other = split.other.slice(-tail);
+
+    let stderrLines: string[] = [];
+    if (includeErrors) {
+      if (severity === 'errors') stderrLines = errors;
+      else if (severity === 'warnings') stderrLines = warnings;
+      else stderrLines = [...other, ...warnings, ...errors];
+    }
 
     const result = {
       running: state.running,
@@ -1806,12 +1880,17 @@ class GodotServer {
       startedAt: new Date(state.startedAt).toISOString(),
       endedAt: state.endedAt ? new Date(state.endedAt).toISOString() : null,
       output_lines_total: state.output.length,
-      error_lines_total: state.errors.length,
+      stderr_lines_total: state.errors.length,
+      counts: {
+        errors: split.errors.length,
+        warnings: split.warnings.length,
+        other: split.other.length,
+      },
       dropped_lines: state.droppedOutput + state.droppedErrors,
       nextIndex: state.output.length,
       truncated_to_tail: outputFromSince.length > outputTruncatedToTail.length,
       output: outputTruncatedToTail,
-      errors: includeErrors ? errorsTail : [],
+      stderr: stderrLines,
     };
 
     if (args.clear === true) {
@@ -1822,6 +1901,61 @@ class GodotServer {
     }
 
     return ok(result);
+  }
+
+  /**
+   * The Godot editor keeps its own log under the OS user-data directory. A run
+   * started with F5 inside the editor never reaches this server's pipes, so this
+   * file is the only way to see those errors.
+   */
+  private async handleReadEditorLog(args: Record<string, unknown>): Promise<ToolResult> {
+    const projectPath = this.resolveProject(String(args.projectPath ?? ''));
+    const explicit = typeof args.logPath === 'string' ? args.logPath.trim() : '';
+    const logPath = explicit || this.editorLogPath(projectPath);
+
+    if (!existsSync(logPath)) {
+      throw new ToolError(`Editor log not found: ${logPath}`, [
+        'Open the project in the Godot editor once so it creates user://logs/godot.log',
+        'Or pass logPath explicitly',
+      ]);
+    }
+
+    const raw = readFileSync(logPath, 'utf8');
+    const stats = statSync(logPath);
+    const split = classifyStderr(raw.split(/\r?\n/));
+    const tail = typeof args.tail === 'number' ? Math.max(1, Math.trunc(args.tail)) : 200;
+    const severity = typeof args.severity === 'string' ? args.severity : 'all';
+
+    const response: Record<string, unknown> = {
+      logPath,
+      size: stats.size,
+      modifiedAt: stats.mtime.toISOString(),
+      counts: {
+        errors: split.errors.length,
+        warnings: split.warnings.length,
+        prints: split.other.length,
+      },
+    };
+    if (severity !== 'warnings') response.errors = split.errors.slice(-tail);
+    if (severity !== 'errors') response.warnings = split.warnings.slice(-tail);
+    if (severity === 'all') response.prints = split.other.slice(-tail);
+
+    return ok(response);
+  }
+
+  /** `%APPDATA%/Godot/app_userdata/<config/name>/logs/godot.log` (per platform). */
+  private editorLogPath(projectPath: string): string {
+    const settings = this.projectSettings(projectPath);
+    const name = unquote((settings['application'] ?? {})['config/name'] ?? basename(projectPath));
+    let base: string;
+    if (process.platform === 'win32') {
+      base = join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'Godot', 'app_userdata');
+    } else if (process.platform === 'darwin') {
+      base = join(homedir(), 'Library', 'Application Support', 'Godot', 'app_userdata');
+    } else {
+      base = join(process.env.XDG_DATA_HOME ?? join(homedir(), '.local', 'share'), 'godot', 'app_userdata');
+    }
+    return join(base, name, 'logs', 'godot.log');
   }
 
   private async handleStopProject(): Promise<ToolResult> {
