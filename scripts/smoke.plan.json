@@ -1,0 +1,34 @@
+{
+  "listTools": true,
+  "steps": [
+    {
+      "label": "engine version (needs GODOT_PATH)",
+      "tool": "get_godot_version",
+      "args": {}
+    },
+    {
+      "label": "project discovery",
+      "tool": "list_projects",
+      "args": {
+        "directory": "."
+      }
+    },
+    {
+      "label": "path escape must be rejected",
+      "tool": "read_file",
+      "expect": "error",
+      "args": {
+        "projectPath": ".",
+        "filePath": "../../etc/hosts"
+      }
+    },
+    {
+      "label": "unknown project must be rejected",
+      "tool": "get_project_info",
+      "expect": "error",
+      "args": {
+        "projectPath": "/definitely/not/a/project"
+      }
+    }
+  ]
+}
